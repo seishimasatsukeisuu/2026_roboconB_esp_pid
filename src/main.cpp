@@ -88,14 +88,14 @@ void loop()
   {
     if (PS4.isConnected())
     {
-      lx = PS4.LStickX();
+      lx = -PS4.LStickX();
       ly = PS4.LStickY();
       up_straight = PS4.Up();
       down_straight = PS4.Down();
       r_straight = PS4.Right();
       l_straight = PS4.Left();
-      l2 = PS4.L2Value();
-      r2 = PS4.R2Value();
+      l2 = -PS4.L2Value();
+      r2 = -PS4.R2Value();
       crossState = PS4.Cross();
 
       vx = ly;
@@ -122,16 +122,16 @@ void loop()
       if (r_straight)
       {
         vx = 0;
-        vy = 100;
+        vy = -100;
       }
       if (l_straight)
       {
         vx = 0;
-        vy = -100;
+        vy = 100;
       }
 
       constexpr float INV_SQRT2 = 0.70710678f;
-      rot = (l2 - r2);
+      rot = (l2 - r2) * 0.5f;
       float gain = 20.0f;
 
       float v1 = ((-vx + vy) * INV_SQRT2 + rot) * gain;
