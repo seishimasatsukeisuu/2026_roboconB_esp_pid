@@ -2,6 +2,14 @@
 #include <CAN.h>
 #include <PS4Controller.h>
 #include "SpeedPID.h"
+#include <math.h>
+
+#include <esp_now.h>
+#include <WiFi.h>
+
+// 受信側のMACアドレスを入れる
+uint8_t receiverMac[] = {0x48, 0xE7, 0x29, 0xA3, 0xBF, 0xCC};
+bool esp_now_send_available = true;
 
 // PS4入力
 int lx;
@@ -28,31 +36,37 @@ int16_t prev_count_2;
 int16_t prev_count_3;
 
 // 現在位置
-float x;     // count_1(前後方向)
-float y;     // count_2(左右方向)
-float theta; // count_3(回転)
+float x = 0.0f;     // count_1(前後方向)
+float y = 0.0f;     // count_2(左右方向)
+float theta = 0.0f; // count_3(回転)
 
 // エンコーダカウント → mm変換
 float scale_x = 0.05f; // 1count あたり何mm動くか
 float scale_y = 0.05f;
-float scale_theta = 0.1f; // 1countあたり何deg(rad)か
 
 // PID制御器(Kp(比例), Ki(積分), Kd(微分), pwm出力制限)
 const int16_t PWM_LIMIT = 2999; // pwmの最大値
 SpeedPID pid_x(0.05, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT);
 SpeedPID pid_y(0.05, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT);
 SpeedPID pid_theta(0.05, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT);
+const int16_t AUTO_PWM_LIMIT = 1200;
 
 // 目標座標
-int target_x = 200;
+int target_x = 0;
 int target_y = 0;
-int target_theta = 0;
+float target_theta = 0.0f; // rad
+
+// ロボット中心からE1,E3までの距離
+const float L = 355.0f; // mm
 
 // モード切り替え
 bool auto_mode = 0;
 
 // エンコーダ1回転あたりのカウント数
 const double ENC_COUNTS_PER_REV = 4096.0 * 2.;
+
+const float wheel_radius = 30.0f; // 計測輪半径(mm) 30mm
+const float mm_per_count = 2.0f * PI * wheel_radius / ENC_COUNTS_PER_REV;
 
 // ギア比(補正係数)実際の回転数に変換するため
 const double GEAR_RATIO = 1.;
@@ -61,12 +75,74 @@ const double GEAR_RATIO = 1.;
 const long CONTROL_CYCLE = 20000;
 const float dt = CONTROL_CYCLE * 1.0e-6f;
 
+// espnowのやつ
+typedef struct
+{
+  int target_x;
+  int target_y;
+  float target_theta;
+} TargetData;
+
+void OnDataSend(const uint8_t *mac_addr, esp_now_send_status_t status)
+{
+  esp_now_send_available = true;
+}
+TargetData recvTarget;
+
+void OnDataRecv(const uint8_t *mac,
+                const uint8_t *incomingData,
+                int len)
+{
+  if (len == sizeof(TargetData))
+  {
+    memcpy(&recvTarget, incomingData, sizeof(TargetData));
+
+    target_x = recvTarget.target_x;
+    target_y = recvTarget.target_y;
+    target_theta = recvTarget.target_theta;
+
+    Serial.printf("Target : %d %d %.2f\n",
+                  target_x,
+                  target_y,
+                  target_theta);
+  }
+}
+
 void setup()
 {
   Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  Serial.print("My MAC = ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK)
+  {
+    Serial.println("ESP初期化失敗");
+    return;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMac, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK)
+  {
+    Serial.println("ピア追加失敗");
+    return;
+  }
+
+  Serial.println("文字を入力してください");
+
+  esp_now_register_send_cb(OnDataSend);
+  esp_now_register_recv_cb(OnDataRecv); // 受信コールバック登録
+
   while (!Serial)
     ;
-  PS4.begin("E4:65:B8:7E:05:4A");
+  PS4.begin("00:02:5b:00:a5:ac");
 
   CAN.setPins(4, 5);      // 16,17ピンはつかえない(4,5ピンは使えた)
   if (!CAN.begin(1000E3)) // 1000kbpsで開始
@@ -131,7 +207,7 @@ void loop()
       }
 
       constexpr float INV_SQRT2 = 0.70710678f;
-      rot = (l2 - r2) * 0.5f;
+      rot = (l2 - r2) * 0.25f;
       float gain = 20.0f;
 
       float v1 = ((-vx + vy) * INV_SQRT2 + rot) * gain;
@@ -170,13 +246,18 @@ void loop()
   // CAN受信
   int packetSize = CAN.parsePacket();
   static uint8_t rx[8] = {0};
-  if (packetSize == 8 && CAN.packetId() == 0x100)
+  if (packetSize == 8 && CAN.packetId() == 0x101)
   {
     for (int i = 0; i < 8; i++)
     {
       rx[i] = CAN.read();
+      // Serial.println(rx[i]);
     }
   }
+  // else
+  // {
+  //   Serial.println("CAN dekinu");
+  // }
 
   static uint32_t last_control = 0;
 
@@ -223,19 +304,24 @@ void loop()
     prev_count_2 = count_2;
     prev_count_3 = count_3;
 
-    // 自己位置更新
-    x += dc1 * scale_x;
-    y += dc2 * scale_y;
-    theta += dc3 * scale_theta;
+    // printf("count1 = %d, count2 = %d, count3 = %d\n", count_1, count_2, count_3);
 
-    while (theta >= 360)
-      theta -= 360;
-    while (theta < 0)
-      theta += 360;
-    while (target_theta >= 360)
-      target_theta -= 360;
-    while (target_theta < 0)
-      target_theta += 360;
+    float s1 = dc1 * mm_per_count;
+    float s2 = dc2 * mm_per_count;
+    float s3 = dc3 * mm_per_count;
+
+    // 自己位置更新
+    x += (s1 + s3) * 0.5f;
+    y += s2;
+    theta += (s3 - s1) / (2.0f * L); // ←ここでradになる
+
+    const float PI_F = 3.14159265f;
+
+    while (theta > PI_F)
+      theta -= 2 * PI_F;
+
+    while (theta < -PI_F)
+      theta += 2 * PI_F;
 
     if (auto_mode == 1) // 自動入力(PID)
     {
@@ -244,17 +330,17 @@ void loop()
 
       // ±180° に収める
       float err_theta = target_theta - theta;
-      while (err_theta > 180)
-        err_theta -= 360;
-      while (err_theta < -180)
-        err_theta += 360;
+      while (err_theta > PI_F)
+        err_theta -= 2 * PI_F;
+      while (err_theta < -PI_F)
+        err_theta += 2 * PI_F;
 
       // 誤差0を目標にPID
       rot = pid_theta.update(0, -err_theta, dt);
 
       constexpr float INV_SQRT2 = 0.70710678f;
 
-      float gain = 1;
+      float gain = 0.4f;
 
       float v1 = ((-vx + vy) * INV_SQRT2 + rot) * gain;
       float v2 = ((vx + vy) * INV_SQRT2 + rot) * gain;
@@ -265,13 +351,13 @@ void loop()
 
       for (int i = 0; i < 4; i++)
       {
-        motor[i] = (int16_t)constrain(v[i], -2999, 2999);
+        motor[i] = (int16_t)constrain(v[i], -AUTO_PWM_LIMIT, AUTO_PWM_LIMIT);
       }
 
       // 到達判定(目標位置に到達したことを判定して自動制御を終了する)
-      if (abs(target_x - x) < 100 &&
-          abs(target_y - y) < 100 &&
-          abs(err_theta) < 30)
+      if (fabsf(target_x - x) < 100.0f &&
+          fabsf(target_y - y) < 100.0f &&
+          fabsf(err_theta) < 5.0f * PI_F / 180.0f) // 5度をラジアンに変換
       {
         for (int i = 0; i < 4; i++)
           motor[i] = 0;
@@ -286,37 +372,20 @@ void loop()
   }
 
   // CAN送信
-  CAN.beginPacket(0x101);
-  for (int i = 0; i < 4; i++)
+  static uint32_t last_can_tx = 0;
+
+  if (micros() - last_can_tx >= 20000)
   {
-    CAN.write((uint8_t)(motor[i] >> 8));
-    CAN.write((uint8_t)(motor[i] & 0xFF));
+    last_can_tx += 20000;
+
+    CAN.beginPacket(0x103);
+
+    for (int i = 0; i < 4; i++)
+    {
+      CAN.write((uint8_t)(motor[i] >> 8));
+      CAN.write((uint8_t)(motor[i] & 0xFF));
+    }
+
+    CAN.endPacket();
   }
-  CAN.endPacket();
-
-  /*
-  //デバック用
-  // 回転数計算
-  double rpm = dc1 * GEAR_RATIO / ENC_COUNTS_PER_REV / dt * 60;
-
-  static uint32_t last_print = 0;
-
-  // エンコーダー値確認用
-  if (millis() - last_print > 100)
-  {
-      last_print = millis();
-
-      printf("%ld %ld %ld\n", count_1, count_2, count_3);
-  }
-
-  // エンコーダーから速度取得
-  int vel1 = dc1 / dt;
-  int vel2 = dc2 / dt;
-
-  printf(
-        "x=%.1f y=%.1f th=%.1f  tx=%d ty=%d tth=%d\n",
-        x,y,theta,
-        target_x,target_y,target_theta
-    );
-         */
 }
