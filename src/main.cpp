@@ -20,7 +20,15 @@ int r_straight;
 int l_straight;
 int l2;
 int r2;
-int crossState;
+// int crossState;
+
+int circleState = false; // ベル直
+int lastcircleState = false;
+
+int triangleState = false; // ちょっとだけ前進
+int lasttriangleState = false;
+int crossState = false; // ちょっと後退
+int lastcrossState = false;
 
 // CAN送信用
 int16_t motor[4] = {0};
@@ -46,15 +54,24 @@ float scale_y = 0.05f;
 
 // PID制御器(Kp(比例), Ki(積分), Kd(微分), pwm出力制限)
 const int16_t PWM_LIMIT = 2999; // pwmの最大値
-SpeedPID pid_x(0.05, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT);
-SpeedPID pid_y(0.05, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT);
-SpeedPID pid_theta(0.05, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT);
+SpeedPID pid_x(1.0, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT);
+SpeedPID pid_y(1.0, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT);
+SpeedPID pid_theta(1.0, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT); // 5
 const int16_t AUTO_PWM_LIMIT = 1200;
+
+// 自動制御の速度制限
+float auto_vx = 0.0f;
+float auto_vy = 0.0f;
+
+// 加速度制限(mm/s^2)
+const float AUTO_ACCEL = 300.0f;
 
 // 目標座標
 int target_x = 0;
 int target_y = 0;
 float target_theta = 0.0f; // rad
+
+const float ERROR = 25.0f;
 
 // ロボット中心からE1,E3までの距離
 const float L = 355.0f; // mm
@@ -97,9 +114,21 @@ void OnDataRecv(const uint8_t *mac,
   {
     memcpy(&recvTarget, incomingData, sizeof(TargetData));
 
-    target_x = recvTarget.target_x;
-    target_y = recvTarget.target_y;
-    target_theta = recvTarget.target_theta;
+    // 相対位置に変更
+    float dx = (float)recvTarget.target_x;
+    float dy = (float)recvTarget.target_y;
+
+    target_x = (int)(x + dx * cosf(theta) - dy * sinf(theta));
+    target_y = (int)(y + dx * sinf(theta) + dy * cosf(theta) * (-1));
+    target_theta = theta + recvTarget.target_theta;
+
+    auto_mode = 1;
+    pid_x.reset();
+    pid_y.reset();
+    pid_theta.reset();
+
+    auto_vx = 0.0f;
+    auto_vy = 0.0f;
 
     Serial.printf("Target : %d %d %.2f\n",
                   target_x,
@@ -160,6 +189,7 @@ void setup()
 
 void loop()
 {
+
   if (auto_mode == 0) // 手動入力(PS4)
   {
     if (PS4.isConnected())
@@ -172,7 +202,45 @@ void loop()
       l_straight = PS4.Left();
       l2 = -PS4.L2Value();
       r2 = -PS4.R2Value();
-      crossState = PS4.Cross();
+      // crossState = PS4.Cross();
+
+      circleState = PS4.data.button.circle;
+
+      triangleState = PS4.data.button.triangle;
+      crossState = PS4.data.button.cross;
+
+      if (circleState && !lastcircleState)
+      {
+        printf("osita\r\n");
+        CAN.beginPacket(0x102);
+
+        CAN.write(1);
+
+        CAN.endPacket();
+      }
+      lastcircleState = circleState;
+
+      if (triangleState && !lasttriangleState)
+      {
+        printf("osita\r\n");
+        CAN.beginPacket(0x105);
+
+        CAN.write(2);
+
+        CAN.endPacket();
+      }
+      lasttriangleState = triangleState;
+
+      if (crossState && !lastcrossState)
+      {
+        printf("osita\r\n");
+        CAN.beginPacket(0x105);
+
+        CAN.write(3);
+
+        CAN.endPacket();
+      }
+      lastcrossState = crossState;
 
       vx = ly;
       vy = lx;
@@ -207,13 +275,13 @@ void loop()
       }
 
       constexpr float INV_SQRT2 = 0.70710678f;
-      rot = (l2 - r2) * 0.25f;
+      rot = (r2 - l2) * 0.25f;
       float gain = 20.0f;
 
       float v1 = ((-vx + vy) * INV_SQRT2 + rot) * gain;
       float v2 = ((vx + vy) * INV_SQRT2 + rot) * gain;
-      float v3 = ((vx - vy) * INV_SQRT2 + rot) * gain;
-      float v4 = ((-vx - vy) * INV_SQRT2 + rot) * gain;
+      float v3 = ((-vx - vy) * INV_SQRT2 + rot) * gain;
+      float v4 = ((vx - vy) * INV_SQRT2 + rot) * gain;
 
       float v[4] = {v1, v2, v3, v4};
 
@@ -222,18 +290,18 @@ void loop()
         motor[i] = (int16_t)constrain(v[i], -2999, 2999);
       }
 
-      static bool prev_cross = false;
+      // static bool prev_cross = false;
 
-      if (crossState && !prev_cross)
-      {
-        auto_mode = !auto_mode;
+      // if (crossState && !prev_cross)
+      // {
+      //   auto_mode = !auto_mode;
 
-        pid_x.reset();
-        pid_y.reset();
-        pid_theta.reset();
-      }
+      //   pid_x.reset();
+      //   pid_y.reset();
+      //   pid_theta.reset();
+      // }
 
-      prev_cross = crossState;
+      // prev_cross = crossState;
     }
 
     if (!PS4.isConnected())
@@ -260,10 +328,11 @@ void loop()
   // }
 
   static uint32_t last_control = 0;
-
+  static uint32_t last_can_tx = 0;
   if (last_control == 0)
   {
     last_control = micros();
+    last_can_tx = micros();
     return;
   }
 
@@ -275,7 +344,7 @@ void loop()
 
     // エンコーダー値取得
     int16_t count_1 =
-        (int16_t)(((uint16_t)rx[0] << 8) | rx[1]);
+        (int16_t)(((uint16_t)rx[0] << 8) | rx[1]) * (-1);
 
     int16_t count_2 =
         (int16_t)(((uint16_t)rx[2] << 8) | rx[3]);
@@ -310,8 +379,13 @@ void loop()
     float s2 = dc2 * mm_per_count;
     float s3 = dc3 * mm_per_count;
 
+    // Serial.printf(
+    //     "dc1=%d dc2=%d dc3=%d | s1=%.2f s2=%.2f s3=%.2f\n",
+    //     dc1, dc2, dc3,
+    //     s1, s2, s3);
+
     // 自己位置更新
-    x += (s1 + s3) * 0.5f;
+    x += (s1 + s3) / 2;
     y += s2;
     theta += (s3 - s1) / (2.0f * L); // ←ここでradになる
 
@@ -325,8 +399,35 @@ void loop()
 
     if (auto_mode == 1) // 自動入力(PID)
     {
-      vx = pid_x.update(target_x, x, dt);
-      vy = pid_y.update(target_y, y, dt);
+      // 目標位置までの速度を計算
+      float vx_global = pid_x.update(target_x, x, dt);
+      float vy_global = pid_y.update(target_y, y, dt);
+
+      // 速度制限
+      float max_delta_v = AUTO_ACCEL * dt;
+      float dvx = vx_global - auto_vx;
+      float dvy = vy_global - auto_vy;
+
+      // X方向の速度変化を制限
+      if (dvx > max_delta_v)
+        dvx = max_delta_v;
+
+      if (dvx < -max_delta_v)
+        dvx = -max_delta_v;
+
+      // Y方向の速度変化を制限
+      if (dvy > max_delta_v)
+        dvy = max_delta_v;
+
+      if (dvy < -max_delta_v)
+        dvy = -max_delta_v;
+
+      auto_vx += dvx;
+      auto_vy += dvy;
+
+      // 回転計算
+      vx = auto_vx * cosf(theta) + auto_vy * sinf(theta);
+      vy = -auto_vx * sinf(theta) + auto_vy * cosf(theta);
 
       // ±180° に収める
       float err_theta = target_theta - theta;
@@ -340,12 +441,12 @@ void loop()
 
       constexpr float INV_SQRT2 = 0.70710678f;
 
-      float gain = 0.4f;
+      float gain = 8.0f;
 
       float v1 = ((-vx + vy) * INV_SQRT2 + rot) * gain;
       float v2 = ((vx + vy) * INV_SQRT2 + rot) * gain;
-      float v3 = ((vx - vy) * INV_SQRT2 + rot) * gain;
-      float v4 = ((-vx - vy) * INV_SQRT2 + rot) * gain;
+      float v3 = ((-vx - vy) * INV_SQRT2 + rot) * gain;
+      float v4 = ((vx - vy) * INV_SQRT2 + rot) * gain;
 
       float v[4] = {v1, v2, v3, v4};
 
@@ -354,29 +455,37 @@ void loop()
         motor[i] = (int16_t)constrain(v[i], -AUTO_PWM_LIMIT, AUTO_PWM_LIMIT);
       }
 
+      Serial.printf(
+          "x=%.1f y=%.1f theta=%.3f | vx=%.2f vy=%.2f rot=%.2f | motor=%d %d %d %d\n",
+          x, y, theta,
+          vx, vy, rot,
+          motor[0], motor[1], motor[2], motor[3]);
+
       // 到達判定(目標位置に到達したことを判定して自動制御を終了する)
-      if (fabsf(target_x - x) < 100.0f &&
-          fabsf(target_y - y) < 100.0f &&
+      if (fabsf(target_x - x) < ERROR &&
+          fabsf(target_y - y) < ERROR &&
           fabsf(err_theta) < 5.0f * PI_F / 180.0f) // 5度をラジアンに変換
       {
         for (int i = 0; i < 4; i++)
           motor[i] = 0;
 
+        auto_vx = 0.0f;
+        auto_vy = 0.0f;
+
         pid_x.reset();
         pid_y.reset();
         pid_theta.reset();
 
-        auto_mode = 0;
+        // auto_mode = 0;
       }
     }
   }
 
   // CAN送信
-  static uint32_t last_can_tx = 0;
 
   if (micros() - last_can_tx >= 20000)
   {
-    last_can_tx += 20000;
+    last_can_tx = micros();
 
     CAN.beginPacket(0x103);
 
