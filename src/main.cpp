@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <CAN.h>
 #include <PS4Controller.h>
-#include "SpeedPID.h"
+#include "Pid.h"
 #include <math.h>
 
 #include <esp_now.h>
@@ -54,9 +54,9 @@ float scale_y = 0.05f;
 
 // PID制御器(Kp(比例), Ki(積分), Kd(微分), pwm出力制限)
 const int16_t PWM_LIMIT = 2999; // pwmの最大値
-SpeedPID pid_x(1.0, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT);
-SpeedPID pid_y(1.0, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT);
-SpeedPID pid_theta(1.0, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT); // 5
+PositionPID pid_x(0.2, 0.025, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
+PositionPID pid_y(0.2, 0.01, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
+PositionPID pid_theta(17.0, 0.4, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
 const int16_t AUTO_PWM_LIMIT = 1200;
 
 // 自動制御の速度制限
@@ -65,6 +65,7 @@ float auto_vy = 0.0f;
 
 // 加速度制限(mm/s^2)
 const float AUTO_ACCEL = 300.0f;
+const float AUTO_MAX_V = 100.0f;
 
 // 目標座標
 int target_x = 0;
@@ -116,16 +117,16 @@ void OnDataRecv(const uint8_t *mac,
 
     // 相対位置に変更
     float dx = (float)recvTarget.target_x;
-    float dy = (float)recvTarget.target_y;
+    float dy = (float)recvTarget.target_y * (-1);
 
     target_x = (int)(x + dx * cosf(theta) - dy * sinf(theta));
-    target_y = (int)(y + dx * sinf(theta) + dy * cosf(theta) * (-1));
+    target_y = (int)(y + dx * sinf(theta) + dy * cosf(theta));
     target_theta = theta + recvTarget.target_theta;
 
     auto_mode = 1;
-    pid_x.reset();
-    pid_y.reset();
-    pid_theta.reset();
+    pid_x.reset(x);
+    pid_y.reset(y);
+    pid_theta.reset(theta);
 
     auto_vx = 0.0f;
     auto_vy = 0.0f;
@@ -223,7 +224,7 @@ void loop()
       if (triangleState && !lasttriangleState)
       {
         printf("osita\r\n");
-        CAN.beginPacket(0x105);
+        CAN.beginPacket(0x102);
 
         CAN.write(2);
 
@@ -231,16 +232,16 @@ void loop()
       }
       lasttriangleState = triangleState;
 
-      if (crossState && !lastcrossState)
-      {
-        printf("osita\r\n");
-        CAN.beginPacket(0x105);
+      // if (crossState && !lastcrossState)
+      // {
+      //   printf("osita\r\n");
+      //   CAN.beginPacket(0x105);
 
-        CAN.write(3);
+      //   CAN.write(3);
 
-        CAN.endPacket();
-      }
-      lastcrossState = crossState;
+      //   CAN.endPacket();
+      // }
+      // lastcrossState = crossState;
 
       vx = ly;
       vy = lx;
@@ -385,9 +386,13 @@ void loop()
     //     s1, s2, s3);
 
     // 自己位置更新
-    x += (s1 + s3) / 2;
-    y += s2;
-    theta += (s3 - s1) / (2.0f * L); // ←ここでradになる
+    float dx_local = (s1 + s3) * (-1) * 0.5f;
+    float dy_local = s2;
+    float dtheta = (s3 - s1) / (2.0f * L);
+
+    x += dx_local * cosf(theta) - dy_local * sinf(theta);
+    y += dx_local * sinf(theta) + dy_local * cosf(theta);
+    theta += dtheta;
 
     const float PI_F = 3.14159265f;
 
@@ -399,9 +404,28 @@ void loop()
 
     if (auto_mode == 1) // 自動入力(PID)
     {
+      float error_x = target_x - x;
+      float error_y = target_y - y;
+
+      float distance = sqrtf(error_x * error_x + error_y * error_y);
+
+      float max_v = AUTO_MAX_V;
+
+      if (distance < 100.0f)
+      {
+        max_v = 50.0f;
+      }
+      else if (distance < 200.0f)
+      {
+        max_v = 100.0f;
+      }
+
       // 目標位置までの速度を計算
       float vx_global = pid_x.update(target_x, x, dt);
       float vy_global = pid_y.update(target_y, y, dt);
+
+      vx_global = constrain(vx_global, -max_v, max_v);
+      vy_global = constrain(vy_global, -max_v, max_v);
 
       // 速度制限
       float max_delta_v = AUTO_ACCEL * dt;
@@ -450,10 +474,34 @@ void loop()
 
       float v[4] = {v1, v2, v3, v4};
 
+      if (fabsf(v1) < 70)
+        v1 = 0;
+      if (fabsf(v2) < 70)
+        v2 = 0;
+      if (fabsf(v3) < 70)
+        v3 = 0;
+      if (fabsf(v4) < 70)
+        v4 = 0;
+
       for (int i = 0; i < 4; i++)
       {
         motor[i] = (int16_t)constrain(v[i], -AUTO_PWM_LIMIT, AUTO_PWM_LIMIT);
       }
+
+      Serial.printf(
+          "target=(%d,%d) pos=(%.1f,%.1f) "
+          "error=(%.1f,%.1f) "
+          "PID=(%.2f,%.2f) "
+          "auto=(%.2f,%.2f) "
+          "local=(%.2f,%.2f) "
+          "rot=%.2f\n",
+          target_x, target_y,
+          x, y,
+          error_x, error_y,
+          vx_global, vy_global,
+          auto_vx, auto_vy,
+          vx, vy,
+          rot);
 
       Serial.printf(
           "x=%.1f y=%.1f theta=%.3f | vx=%.2f vy=%.2f rot=%.2f | motor=%d %d %d %d\n",
@@ -461,23 +509,23 @@ void loop()
           vx, vy, rot,
           motor[0], motor[1], motor[2], motor[3]);
 
-      // 到達判定(目標位置に到達したことを判定して自動制御を終了する)
-      if (fabsf(target_x - x) < ERROR &&
-          fabsf(target_y - y) < ERROR &&
-          fabsf(err_theta) < 5.0f * PI_F / 180.0f) // 5度をラジアンに変換
-      {
-        for (int i = 0; i < 4; i++)
-          motor[i] = 0;
+      // 到達判定(位置保持)
+      // if (fabsf(target_x - x) < ERROR &&
+      //     fabsf(target_y - y) < ERROR &&
+      //     fabsf(err_theta) < 5.0f * PI_F / 180.0f) // 5度をラジアンに変換
+      // {
+      //   for (int i = 0; i < 4; i++)
+      //     motor[i] = 0;
 
-        auto_vx = 0.0f;
-        auto_vy = 0.0f;
+      //   auto_vx = 0.0f;
+      //   auto_vy = 0.0f;
 
-        pid_x.reset();
-        pid_y.reset();
-        pid_theta.reset();
+      //   // pid_x.reset(x);
+      //   // pid_y.reset(y);
+      //   // pid_theta.reset(theta);
 
-        // auto_mode = 0;
-      }
+      //   auto_mode = 0;
+      // }
     }
   }
 
