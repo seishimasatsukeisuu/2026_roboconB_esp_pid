@@ -3,12 +3,12 @@
 #include <PS4Controller.h>
 #include "Pid.h"
 #include <math.h>
-
 #include <esp_now.h>
 #include <WiFi.h>
 
 // 受信側のMACアドレスを入れる
-uint8_t receiverMac[] = {0x48, 0xE7, 0x29, 0xA3, 0xBF, 0xCC};
+// uint8_t receiverMac[] = {0x48, 0xE7, 0x29, 0xA3, 0xBF, 0xCC};//パソコン
+uint8_t receiverMac[] = {0x08, 0xB6, 0x1F, 0xED, 0x5E, 0x34}; // タブレット
 bool esp_now_send_available = true;
 
 // PS4入力
@@ -20,18 +20,17 @@ int r_straight;
 int l_straight;
 int l2;
 int r2;
-// int crossState;
 
-int circleState = false; // ベル直
+// ベル直入力
+int circleState = false; // pwm 2999
 int lastcircleState = false;
-
-int triangleState = false; // ちょっとだけ前進
+int triangleState = false; // pwm 500
 int lasttriangleState = false;
-int crossState = false; // ちょっと後退
-int lastcrossState = false;
 
-// CAN送信用
+// CAN pwm送信用
 int16_t motor[4] = {0};
+// ベル直データ送信用
+uint8_t data[8] = {0};
 
 // CANデータ計算用
 float vx;
@@ -42,6 +41,7 @@ float rot;
 int16_t prev_count_1;
 int16_t prev_count_2;
 int16_t prev_count_3;
+int16_t prev_count_4; // ベル直のエンコーダー
 
 // 現在位置
 float x = 0.0f;     // count_1(前後方向)
@@ -54,9 +54,9 @@ float scale_y = 0.05f;
 
 // PID制御器(Kp(比例), Ki(積分), Kd(微分), pwm出力制限)
 const int16_t PWM_LIMIT = 2999; // pwmの最大値
-PositionPID pid_x(0.2, 0.025, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
-PositionPID pid_y(0.2, 0.01, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
-PositionPID pid_theta(17.0, 0.4, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
+PositionPID pid_x(0.6, 0.1, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
+PositionPID pid_y(0.6, 0.1, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
+PositionPID pid_theta(35.0, 1.5, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
 const int16_t AUTO_PWM_LIMIT = 1200;
 
 // 自動制御の速度制限
@@ -71,19 +71,19 @@ const float AUTO_MAX_V = 100.0f;
 int target_x = 0;
 int target_y = 0;
 float target_theta = 0.0f; // rad
-
-const float ERROR = 25.0f;
+const float ERROR = 25.0f; // 目標位置±25mmで停止
 
 // ロボット中心からE1,E3までの距離
 const float L = 355.0f; // mm
 
-// モード切り替え
+//  入力モード切り替え
 bool auto_mode = 0;
 
 // エンコーダ1回転あたりのカウント数
 const double ENC_COUNTS_PER_REV = 4096.0 * 2.;
 
-const float wheel_radius = 30.0f; // 計測輪半径(mm) 30mm
+// 計測輪半径(mm) 30mm
+const float wheel_radius = 30.0f;
 const float mm_per_count = 2.0f * PI * wheel_radius / ENC_COUNTS_PER_REV;
 
 // ギア比(補正係数)実際の回転数に変換するため
@@ -93,37 +93,79 @@ const double GEAR_RATIO = 1.;
 const long CONTROL_CYCLE = 20000;
 const float dt = CONTROL_CYCLE * 1.0e-6f;
 
-// espnowのやつ
-typedef struct
+// ESP-NOW送信周期：100ms
+const unsigned long ESP_NOW_TX_CYCLE = 100000;
+unsigned long last_esp_now_tx = 0;
+
+// espnow
+typedef struct __attribute__((packed))
 {
-  int target_x;
-  int target_y;
-  float target_theta;
-} TargetData;
+  uint8_t command_type;
+  int32_t param1;
+  int32_t param2;
+  float param3;
+} EspNowMessage;
+
+EspNowMessage recvMsg;
+
+bool esp_now_connected = false;
 
 void OnDataSend(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
   esp_now_send_available = true;
+  if (status == ESP_NOW_SEND_SUCCESS)
+  {
+    esp_now_connected = true;
+  }
+  else
+  {
+    esp_now_connected = false;
+    Serial.println("ESP-NOW DISCONNECTED");
+  }
 }
-TargetData recvTarget;
+EspNowMessage recvTarget;
 
 void OnDataRecv(const uint8_t *mac,
                 const uint8_t *incomingData,
                 int len)
 {
-  if (len == sizeof(TargetData))
+  if (len != sizeof(EspNowMessage))
+    return;
+
+  memcpy(&recvMsg, incomingData, sizeof(EspNowMessage));
+
+  switch (recvMsg.command_type)
   {
-    memcpy(&recvTarget, incomingData, sizeof(TargetData));
+  case 0x0A: // 緊急停止
+    Serial.println("Emergency Stop");
 
-    // 相対位置に変更
-    float dx = (float)recvTarget.target_x;
-    float dy = (float)recvTarget.target_y * (-1);
+    auto_mode = 0;
 
+    for (int i = 0; i < 4; i++)
+      motor[i] = 0;
+
+    auto_vx = 0.0f;
+    auto_vy = 0.0f;
+
+    break;
+
+  case 0x10: // 座標指示
+  {
+    float dx = (float)recvMsg.param1;
+
+    // 座標系を合わせる必要があるなら反転
+    float dy = (float)recvMsg.param2 * (-1.0f);
+
+    // ロボット座標 → グローバル座標
     target_x = (int)(x + dx * cosf(theta) - dy * sinf(theta));
+
     target_y = (int)(y + dx * sinf(theta) + dy * cosf(theta));
-    target_theta = theta + recvTarget.target_theta;
+
+    // すでにradへ変換されている
+    target_theta = theta + recvMsg.param3;
 
     auto_mode = 1;
+
     pid_x.reset(x);
     pid_y.reset(y);
     pid_theta.reset(theta);
@@ -131,10 +173,69 @@ void OnDataRecv(const uint8_t *mac,
     auto_vx = 0.0f;
     auto_vy = 0.0f;
 
-    Serial.printf("Target : %d %d %.2f\n",
-                  target_x,
-                  target_y,
-                  target_theta);
+    // Serial.printf(
+    //     "Target : %d %d %.3f rad\n",
+    //     target_x,
+    //     target_y,
+    //     target_theta);
+
+    break;
+  }
+
+  case 0x11:
+  {
+    // 絶対座標指定: 変換せずそのまま目標値に
+    target_x = recvMsg.param1;
+    target_y = recvMsg.param2;
+    target_theta = recvMsg.param3; // ラジアンの絶対角度
+
+    auto_mode = 1;
+    pid_x.reset(x);
+    pid_y.reset(y);
+    pid_theta.reset(theta);
+    auto_vx = 0.0f;
+    auto_vy = 0.0f;
+    Serial.printf("Target Absolute : %d %d %.3f rad\n", target_x, target_y, target_theta);
+    break;
+  }
+
+  case 0x40: // set_shoot
+  {
+    Serial.printf(
+        "Shoot setting: PWM=%ld duration=%.3f\n",
+        (long)recvMsg.param1,
+        recvMsg.param3);
+
+    int32_t pwm = recvMsg.param1;
+    float duration = recvMsg.param3;
+
+    // param1: int32_t → 4byte
+    memcpy(&data[0], &pwm, sizeof(int32_t));
+    // param3: float → 4byte
+    memcpy(&data[4], &duration, sizeof(float));
+
+    if (!esp_now_connected)
+    {
+      for (int i = 0; i < 8; i++)
+      {
+        data[i] = 0;
+      }
+    }
+
+    CAN.beginPacket(0x102);
+    for (int i = 0; i < 8; i++)
+    {
+      CAN.write(data[i]);
+    }
+    CAN.endPacket();
+    break;
+  }
+
+  default:
+    // Serial.printf(
+    //     "Unknown command: 0x%02X\n",
+    //     recvMsg.command_type);
+    break;
   }
 }
 
@@ -164,8 +265,6 @@ void setup()
     Serial.println("ピア追加失敗");
     return;
   }
-
-  Serial.println("文字を入力してください");
 
   esp_now_register_send_cb(OnDataSend);
   esp_now_register_recv_cb(OnDataRecv); // 受信コールバック登録
@@ -203,16 +302,12 @@ void loop()
       l_straight = PS4.Left();
       l2 = -PS4.L2Value();
       r2 = -PS4.R2Value();
-      // crossState = PS4.Cross();
 
       circleState = PS4.data.button.circle;
-
       triangleState = PS4.data.button.triangle;
-      crossState = PS4.data.button.cross;
 
       if (circleState && !lastcircleState)
       {
-        printf("osita\r\n");
         CAN.beginPacket(0x102);
 
         CAN.write(1);
@@ -223,7 +318,6 @@ void loop()
 
       if (triangleState && !lasttriangleState)
       {
-        printf("osita\r\n");
         CAN.beginPacket(0x102);
 
         CAN.write(2);
@@ -231,17 +325,6 @@ void loop()
         CAN.endPacket();
       }
       lasttriangleState = triangleState;
-
-      // if (crossState && !lastcrossState)
-      // {
-      //   printf("osita\r\n");
-      //   CAN.beginPacket(0x105);
-
-      //   CAN.write(3);
-
-      //   CAN.endPacket();
-      // }
-      // lastcrossState = crossState;
 
       vx = ly;
       vy = lx;
@@ -290,19 +373,6 @@ void loop()
       {
         motor[i] = (int16_t)constrain(v[i], -2999, 2999);
       }
-
-      // static bool prev_cross = false;
-
-      // if (crossState && !prev_cross)
-      // {
-      //   auto_mode = !auto_mode;
-
-      //   pid_x.reset();
-      //   pid_y.reset();
-      //   pid_theta.reset();
-      // }
-
-      // prev_cross = crossState;
     }
 
     if (!PS4.isConnected())
@@ -314,19 +384,23 @@ void loop()
 
   // CAN受信
   int packetSize = CAN.parsePacket();
-  static uint8_t rx[8] = {0};
+  static uint8_t rx[8] = {0};          // 足回りエンコーダーデータ
+  static uint8_t rx_syasyutu[8] = {0}; // 射出エンコーダーデータ
   if (packetSize == 8 && CAN.packetId() == 0x101)
   {
     for (int i = 0; i < 8; i++)
     {
       rx[i] = CAN.read();
-      // Serial.println(rx[i]);
     }
   }
-  // else
-  // {
-  //   Serial.println("CAN dekinu");
-  // }
+
+  if (packetSize == 8 && CAN.packetId() == 0x104)
+  {
+    for (int i = 0; i < 8; i++)
+    {
+      rx_syasyutu[i] = CAN.read();
+    }
+  }
 
   static uint32_t last_control = 0;
   static uint32_t last_can_tx = 0;
@@ -353,6 +427,9 @@ void loop()
     int16_t count_3 =
         (int16_t)(((uint16_t)rx[4] << 8) | rx[5]);
 
+    int16_t count_4 =
+        (int16_t)(((uint16_t)rx_syasyutu[0] << 8) | rx_syasyutu[1]);
+
     // prev_countの初期化用
     static bool first = true;
     if (first)
@@ -360,11 +437,12 @@ void loop()
       prev_count_1 = count_1;
       prev_count_2 = count_2;
       prev_count_3 = count_3;
+      prev_count_4 = count_4;
       first = false;
       return;
     }
 
-    // 増分(速度に対応)
+    // 増分
     int16_t dc1 = count_1 - prev_count_1;
     int16_t dc2 = count_2 - prev_count_2;
     int16_t dc3 = count_3 - prev_count_3;
@@ -373,17 +451,13 @@ void loop()
     prev_count_1 = count_1;
     prev_count_2 = count_2;
     prev_count_3 = count_3;
+    prev_count_4 = count_4;
 
-    // printf("count1 = %d, count2 = %d, count3 = %d\n", count_1, count_2, count_3);
+    // printf("count1 = %d, count2 = %d, count3 = %d, count4 = %d\n", count_1, count_2, count_3, count_4);
 
     float s1 = dc1 * mm_per_count;
     float s2 = dc2 * mm_per_count;
     float s3 = dc3 * mm_per_count;
-
-    // Serial.printf(
-    //     "dc1=%d dc2=%d dc3=%d | s1=%.2f s2=%.2f s3=%.2f\n",
-    //     dc1, dc2, dc3,
-    //     s1, s2, s3);
 
     // 自己位置更新
     float dx_local = (s1 + s3) * (-1) * 0.5f;
@@ -402,13 +476,44 @@ void loop()
     while (theta < -PI_F)
       theta += 2 * PI_F;
 
+    // 座標をESP-NOWで100msごとに送信
+    if (now_us - last_esp_now_tx >= ESP_NOW_TX_CYCLE)
+    {
+      last_esp_now_tx = now_us;
+
+      EspNowMessage encMsg = {0};
+
+      encMsg.command_type = 0x20;
+      encMsg.param1 = (int32_t)x;
+      encMsg.param2 = (int32_t)y;
+      encMsg.param3 = (float)(theta * 180.0f / 3.14159265f);
+
+      if (esp_now_send_available)
+      {
+        esp_now_send_available = false;
+
+        esp_err_t result = esp_now_send(
+            receiverMac,
+            (uint8_t *)&encMsg,
+            sizeof(encMsg));
+
+        if (result == ESP_OK)
+        {
+          Serial.println("SUCCSES_SEND");
+        }
+        else
+        {
+          esp_now_send_available = true;
+          Serial.printf("ESP-NOW send error: %d\n", result);
+        }
+      }
+    }
+
     if (auto_mode == 1) // 自動入力(PID)
     {
       float error_x = target_x - x;
       float error_y = target_y - y;
-
       float distance = sqrtf(error_x * error_x + error_y * error_y);
-
       float max_v = AUTO_MAX_V;
 
       if (distance < 100.0f)
@@ -472,8 +577,6 @@ void loop()
       float v3 = ((-vx - vy) * INV_SQRT2 + rot) * gain;
       float v4 = ((vx - vy) * INV_SQRT2 + rot) * gain;
 
-      float v[4] = {v1, v2, v3, v4};
-
       if (fabsf(v1) < 70)
         v1 = 0;
       if (fabsf(v2) < 70)
@@ -483,32 +586,20 @@ void loop()
       if (fabsf(v4) < 70)
         v4 = 0;
 
+      float v[4] = {v1, v2, v3, v4};
+
       for (int i = 0; i < 4; i++)
       {
         motor[i] = (int16_t)constrain(v[i], -AUTO_PWM_LIMIT, AUTO_PWM_LIMIT);
       }
 
-      Serial.printf(
-          "target=(%d,%d) pos=(%.1f,%.1f) "
-          "error=(%.1f,%.1f) "
-          "PID=(%.2f,%.2f) "
-          "auto=(%.2f,%.2f) "
-          "local=(%.2f,%.2f) "
-          "rot=%.2f\n",
-          target_x, target_y,
-          x, y,
-          error_x, error_y,
-          vx_global, vy_global,
-          auto_vx, auto_vy,
-          vx, vy,
-          rot);
-
-      Serial.printf(
-          "x=%.1f y=%.1f theta=%.3f | vx=%.2f vy=%.2f rot=%.2f | motor=%d %d %d %d\n",
-          x, y, theta,
-          vx, vy, rot,
-          motor[0], motor[1], motor[2], motor[3]);
-
+      if (!esp_now_connected)
+      {
+        for (int i = 0; i < 4; i++)
+        {
+          motor[i] = 0;
+        }
+      }
       // 到達判定(位置保持)
       // if (fabsf(target_x - x) < ERROR &&
       //     fabsf(target_y - y) < ERROR &&
@@ -530,7 +621,6 @@ void loop()
   }
 
   // CAN送信
-
   if (micros() - last_can_tx >= 20000)
   {
     last_can_tx = micros();
