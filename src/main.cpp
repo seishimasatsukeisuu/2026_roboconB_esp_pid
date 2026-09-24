@@ -72,6 +72,9 @@ const float mm_per_count = 2.0f * PI * wheel_radius / ENC_COUNTS_PER_REV;
 // ギア比(補正係数)実際の回転数に変換するため
 const double GEAR_RATIO = 1.;
 
+// ロボットが動き出す最低PWM値
+constexpr float FRICTION_OFFSET = 50.0f;
+
 // 制御周期：20000μs = 20ms
 const long CONTROL_CYCLE = 20000;
 const float dt = CONTROL_CYCLE * 1.0e-6f;
@@ -463,19 +466,24 @@ void loop()
       float v3 = ((-vx - vy) * INV_SQRT2 + rot) * gain;
       float v4 = ((vx - vy) * INV_SQRT2 + rot) * gain;
 
-      if (fabsf(v1) < 70)
-        v1 = 0;
-      if (fabsf(v2) < 70)
-        v2 = 0;
-      if (fabsf(v3) < 70)
-        v3 = 0;
-      if (fabsf(v4) < 70)
-        v4 = 0;
-
       float v[4] = {v1, v2, v3, v4};
 
       for (int i = 0; i < 4; i++)
       {
+        // 微小出力をカット
+        if (v[i] > 1.0f)
+        {
+          v[i] += FRICTION_OFFSET;
+        }
+        else if (v[i] < -1.0f)
+        {
+          v[i] -= FRICTION_OFFSET;
+        }
+        else
+        {
+          v[i] = 0.0f;
+        }
+
         motor[i] = (int16_t)constrain(v[i], -AUTO_PWM_LIMIT, AUTO_PWM_LIMIT);
       }
 
@@ -486,23 +494,6 @@ void loop()
           motor[i] = 0;
         }
       }
-      // 到達判定(位置保持)
-      // if (fabsf(target_x - x) < ERROR &&
-      //     fabsf(target_y - y) < ERROR &&
-      //     fabsf(err_theta) < 5.0f * PI_F / 180.0f) // 5度をラジアンに変換
-      // {
-      //   for (int i = 0; i < 4; i++)
-      //     motor[i] = 0;
-
-      //   auto_vx = 0.0f;
-      //   auto_vy = 0.0f;
-
-      //   // pid_x.reset(x);
-      //   // pid_y.reset(y);
-      //   // pid_theta.reset(theta);
-
-      //   auto_mode = 0;
-      // }
     }
   }
 
