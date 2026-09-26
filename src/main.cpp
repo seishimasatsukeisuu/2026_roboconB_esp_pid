@@ -83,6 +83,20 @@ const float dt = CONTROL_CYCLE * 1.0e-6f;
 const unsigned long ESP_NOW_TX_CYCLE = 100000;
 unsigned long last_esp_now_tx = 0;
 
+// マニュアル移動モード
+bool manual_mode = false;
+float manual_vx_dir = 0.0f;
+float manual_vy_dir = 0.0f;
+float manual_rot_dir = 0.0f;
+uint32_t last_manual_cmd_time = 0;
+
+// マニュアル操作速度
+const float MANUAL_SPEED = 500.0f;
+const float MANUAL_ROT_SPEED = 1.0f;
+
+// マニュアルモード移動のタイムアウト時間(ms)
+const uint32_t MANUAL_TIMEOUT_MS = 300;
+
 // espnow
 typedef struct __attribute__((packed))
 {
@@ -124,15 +138,12 @@ void OnDataRecv(const uint8_t *mac,
   {
   case 0x0A: // 緊急停止
     Serial.println("Emergency Stop");
-
     auto_mode = 0;
-
+    manual_mode = false; // マニュアルモードも強制解除
     for (int i = 0; i < 4; i++)
       motor[i] = 0;
-
     auto_vx = 0.0f;
     auto_vy = 0.0f;
-
     break;
 
   case 0x10: // 座標指示
@@ -214,6 +225,27 @@ void OnDataRecv(const uint8_t *mac,
       CAN.write(data[i]);
     }
     CAN.endPacket();
+    break;
+  }
+
+  case 0x50: // マニュアル移動
+  {
+    manual_vx_dir = (float)recvMsg.param1;
+    manual_vy_dir = (float)recvMsg.param2;
+    manual_rot_dir = recvMsg.param3;
+
+    if (manual_vx_dir == 0.0f && manual_vy_dir == 0.0f && manual_rot_dir == 0.0f)
+    {
+      manual_mode = false;
+      for (int i = 0; i < 4; i++)
+        motor[i] = 0;
+    }
+    else
+    {
+      manual_mode = true;
+      auto_mode = 0;
+      last_manual_cmd_time = millis();
+    }
     break;
   }
 
@@ -486,30 +518,64 @@ void loop()
 
         motor[i] = (int16_t)constrain(v[i], -AUTO_PWM_LIMIT, AUTO_PWM_LIMIT);
       }
+    }
 
-      if (!esp_now_connected)
+    else if (manual_mode) // マニュアル入力
+    {
+      // タイムアウトで停止
+      if (millis() - last_manual_cmd_time > MANUAL_TIMEOUT_MS)
       {
+        manual_mode = false;
         for (int i = 0; i < 4; i++)
         {
           motor[i] = 0;
         }
       }
+      else
+      {
+        float vx_m = manual_vx_dir * MANUAL_SPEED;
+        float vy_m = manual_vy_dir * MANUAL_SPEED;
+        float rot_m = manual_rot_dir * MANUAL_ROT_SPEED;
+
+        constexpr float INV_SQRT2 = 0.70710678f;
+        float gain = 8.0f;
+
+        float v1 = ((-vx_m + vy_m) * INV_SQRT2 + rot_m) * gain;
+        float v2 = ((vx_m + vy_m) * INV_SQRT2 + rot_m) * gain;
+        float v3 = ((-vx_m - vy_m) * INV_SQRT2 + rot_m) * gain;
+        float v4 = ((vx_m - vy_m) * INV_SQRT2 + rot_m) * gain;
+
+        float v[4] = {v1, v2, v3, v4};
+
+        for (int i = 0; i < 4; i++)
+        {
+          motor[i] = (int16_t)constrain(v[i], -AUTO_PWM_LIMIT, AUTO_PWM_LIMIT);
+        }
+      }
     }
-  }
 
-  // CAN送信
-  if (micros() - last_can_tx >= 20000)
-  {
-    last_can_tx = micros();
-
-    CAN.beginPacket(0x103);
-
-    for (int i = 0; i < 4; i++)
+    if (!esp_now_connected)
     {
-      CAN.write((uint8_t)(motor[i] >> 8));
-      CAN.write((uint8_t)(motor[i] & 0xFF));
+      for (int i = 0; i < 4; i++)
+      {
+        motor[i] = 0;
+      }
     }
 
-    CAN.endPacket();
+    // CAN送信
+    if (micros() - last_can_tx >= 20000)
+    {
+      last_can_tx = micros();
+
+      CAN.beginPacket(0x103);
+
+      for (int i = 0; i < 4; i++)
+      {
+        CAN.write((uint8_t)(motor[i] >> 8));
+        CAN.write((uint8_t)(motor[i] & 0xFF));
+      }
+
+      CAN.endPacket();
+    }
   }
 }
