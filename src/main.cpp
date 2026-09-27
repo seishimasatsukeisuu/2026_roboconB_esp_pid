@@ -14,6 +14,20 @@ bool esp_now_send_available = true;
 int16_t motor[4] = {0};
 // ベル直データ送信用
 uint8_t data[8] = {0};
+uint8_t shoot_flag = 0;
+// 足回りエンコーダーデータ受信用
+static uint8_t rx[8] = {0};
+const int CAN_ID_WHEEL_ENC = 0x101;
+int last_wheel_can_rx = 0;
+// 射出エンコーダーデータ受信用
+static uint8_t rx_syasyutu[8] = {0};
+const int CAN_ID_SHOOT_ENC = 0x104;
+int last_shoot_can_rx = 0;
+
+int packetSize = 0;
+
+// CAN受信タイムアウト
+const uint32_t CAN_RX_TIMEOUT_MS = 100;
 
 // CANデータ計算用
 float vx;
@@ -31,30 +45,32 @@ float x = 0.0f;     // count_1(前後方向)
 float y = 0.0f;     // count_2(左右方向)
 float theta = 0.0f; // count_3(回転)
 
-// エンコーダカウント → mm変換
-float scale_x = 0.05f; // 1count あたり何mm動くか
-float scale_y = 0.05f;
-
 // PID制御器(Kp(比例), Ki(積分), Kd(微分), pwm出力制限)
 const int16_t PWM_LIMIT = 2999; // pwmの最大値
-PositionPID pid_x(0.6, 0.1, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
-PositionPID pid_y(0.6, 0.1, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
-PositionPID pid_theta(35.0, 1.5, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
-const int16_t AUTO_PWM_LIMIT = 1200;
+PositionPID pid_x(0.4, 0.1, 0.05, -PWM_LIMIT, PWM_LIMIT, -100, 100);
+PositionPID pid_y(0.4, 0.1, 0.05, -PWM_LIMIT, PWM_LIMIT, -100, 100);
+PositionPID pid_theta(30.0, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
+const int16_t AUTO_PWM_LIMIT = 2999;
 
 // 自動制御の速度制限
 float auto_vx = 0.0f;
 float auto_vy = 0.0f;
 
+float auto_ax = 0.0f;
+float auto_ay = 0.0f;
+
 // 加速度制限(mm/s^2)
-const float AUTO_ACCEL = 300.0f;
-const float AUTO_MAX_V = 100.0f;
+const float AUTO_MAX_V = 400.0f;
+const float AUTO_ACCEL = 1400.0f;
+const float AUTO_DECEL = 1400.0f; // 減速
+const float AUTO_JERK = 15000.0f; // mm/s^3
 
 // 目標座標
 int target_x = 0;
 int target_y = 0;
 float target_theta = 0.0f; // rad
-const float ERROR = 25.0f; // 目標位置±25mmで停止
+const float ERROR = 10.0f; // 目標位置±10mmで停止
+float err_theta = 0.0f;    // 目標との差を計算(±1°で停止)
 
 // ロボット中心からE1,E3までの距離
 const float L = 355.0f; // mm
@@ -144,6 +160,8 @@ void OnDataRecv(const uint8_t *mac,
       motor[i] = 0;
     auto_vx = 0.0f;
     auto_vy = 0.0f;
+    auto_ax = 0.0f;
+    auto_ay = 0.0f;
     break;
 
   case 0x10: // 座標指示
@@ -163,12 +181,12 @@ void OnDataRecv(const uint8_t *mac,
 
     auto_mode = 1;
 
-    pid_x.reset(x);
-    pid_y.reset(y);
-    pid_theta.reset(theta);
+    // pid_x.reset(x);
+    // pid_y.reset(y);
+    // pid_theta.reset(theta);
 
-    auto_vx = 0.0f;
-    auto_vy = 0.0f;
+    // auto_vx = 0.0f;
+    // auto_vy = 0.0f;
 
     // Serial.printf(
     //     "Target : %d %d %.3f rad\n",
@@ -187,21 +205,21 @@ void OnDataRecv(const uint8_t *mac,
     target_theta = recvMsg.param3; // ラジアンの絶対角度
 
     auto_mode = 1;
-    pid_x.reset(x);
-    pid_y.reset(y);
-    pid_theta.reset(theta);
-    auto_vx = 0.0f;
-    auto_vy = 0.0f;
-    Serial.printf("Target Absolute : %d %d %.3f rad\n", target_x, target_y, target_theta);
+    // pid_x.reset(x);
+    // pid_y.reset(y);
+    // pid_theta.reset(theta);
+    // auto_vx = 0.0f;
+    // auto_vy = 0.0f;
+    //  Serial.printf("Target Absolute : %d %d %.3f rad\n", target_x, target_y, target_theta);
     break;
   }
 
   case 0x40: // set_shoot
   {
-    Serial.printf(
-        "Shoot setting: PWM=%ld duration=%.3f\n",
-        (long)recvMsg.param1,
-        recvMsg.param3);
+    // Serial.printf(
+    //     "Shoot setting: PWM=%ld duration=%.3f\n",
+    //     (long)recvMsg.param1,
+    //     recvMsg.param3);
 
     int32_t pwm = recvMsg.param1;
     float duration = recvMsg.param3;
@@ -218,13 +236,8 @@ void OnDataRecv(const uint8_t *mac,
         data[i] = 0;
       }
     }
+    shoot_flag = 1;
 
-    CAN.beginPacket(0x102);
-    for (int i = 0; i < 8; i++)
-    {
-      CAN.write(data[i]);
-    }
-    CAN.endPacket();
     break;
   }
 
@@ -303,24 +316,73 @@ void setup()
 
 void loop()
 {
-  // CAN受信
-  int packetSize = CAN.parsePacket();
-  static uint8_t rx[8] = {0};          // 足回りエンコーダーデータ
-  static uint8_t rx_syasyutu[8] = {0}; // 射出エンコーダーデータ
-  if (packetSize == 8 && CAN.packetId() == 0x101)
+  bool can_wheel_ok =
+      (last_wheel_can_rx != 0) &&
+      (millis() - last_wheel_can_rx < CAN_RX_TIMEOUT_MS);
+
+  if (!can_wheel_ok)
   {
-    for (int i = 0; i < 8; i++)
+    auto_mode = 0;
+    manual_mode = false;
+
+    auto_vx = 0.0f;
+    auto_vy = 0.0f;
+    auto_ax = 0.0f;
+    auto_ay = 0.0f;
+
+    for (int i = 0; i < 4; i++)
     {
-      rx[i] = CAN.read();
+      motor[i] = 0;
     }
   }
 
-  if (packetSize == 8 && CAN.packetId() == 0x104)
+  // CAN受信
+  while ((packetSize = CAN.parsePacket()) > 0)
   {
+    int id = CAN.packetId();
+
+    if (packetSize != 8)
+    {
+      while (CAN.available())
+        CAN.read();
+
+      continue;
+    }
+
+    if (id == CAN_ID_WHEEL_ENC)
+    {
+      for (int i = 0; i < 8; i++)
+      {
+        rx[i] = CAN.read();
+      }
+
+      last_wheel_can_rx = millis();
+    }
+    else if (id == CAN_ID_SHOOT_ENC)
+    {
+      for (int i = 0; i < 8; i++)
+      {
+        rx_syasyutu[i] = CAN.read();
+      }
+
+      last_shoot_can_rx = millis();
+    }
+    else
+    {
+      while (CAN.available())
+        CAN.read();
+    }
+  }
+
+  if (shoot_flag == 1)
+  {
+    CAN.beginPacket(0x102);
     for (int i = 0; i < 8; i++)
     {
-      rx_syasyutu[i] = CAN.read();
+      CAN.write(data[i]);
     }
+    CAN.endPacket();
+    shoot_flag = 0;
   }
 
   static uint32_t last_control = 0;
@@ -364,9 +426,14 @@ void loop()
     }
 
     // 増分
-    int16_t dc1 = count_1 - prev_count_1;
-    int16_t dc2 = count_2 - prev_count_2;
-    int16_t dc3 = count_3 - prev_count_3;
+    int16_t dc1 =
+        (int16_t)((uint16_t)count_1 - (uint16_t)prev_count_1);
+
+    int16_t dc2 =
+        (int16_t)((uint16_t)count_2 - (uint16_t)prev_count_2);
+
+    int16_t dc3 =
+        (int16_t)((uint16_t)count_3 - (uint16_t)prev_count_3);
 
     // 前回のカウント取得
     prev_count_1 = count_1;
@@ -374,7 +441,7 @@ void loop()
     prev_count_3 = count_3;
     prev_count_4 = count_4;
 
-    // printf("count1 = %d, count2 = %d, count3 = %d, count4 = %d\n", count_1, count_2, count_3, count_4);
+    printf("count1 = %d, count2 = %d, count3 = %d, count4 = %d\n", count_1, count_2, count_3, count_4);
 
     float s1 = dc1 * mm_per_count;
     float s2 = dc2 * mm_per_count;
@@ -437,60 +504,83 @@ void loop()
       float distance = sqrtf(error_x * error_x + error_y * error_y);
       float max_v = AUTO_MAX_V;
 
-      if (distance < 100.0f)
-      {
-        max_v = 50.0f;
-      }
-      else if (distance < 200.0f)
-      {
-        max_v = 100.0f;
-      }
+      // if (distance < 100.0f)
+      // {
+      //   max_v = 100.0f;
+      // }
+      // else if (distance < 200.0f)
+      // {
+      //   max_v = 250.0f;
+      // }
 
-      // 目標位置までの速度を計算
+      // 位置PID
       float vx_global = pid_x.update(target_x, x, dt);
       float vy_global = pid_y.update(target_y, y, dt);
 
       vx_global = constrain(vx_global, -max_v, max_v);
       vy_global = constrain(vy_global, -max_v, max_v);
 
-      // 速度制限
-      float max_delta_v = AUTO_ACCEL * dt;
-      float dvx = vx_global - auto_vx;
-      float dvy = vy_global - auto_vy;
+      // ジャーク制限付き速度制御
 
-      // X方向の速度変化を制限
-      if (dvx > max_delta_v)
-        dvx = max_delta_v;
+      // 目標速度に追従するために必要な加速度
+      float desired_ax = (vx_global - auto_vx) / dt;
+      float desired_ay = (vy_global - auto_vy) / dt;
 
-      if (dvx < -max_delta_v)
-        dvx = -max_delta_v;
+      // 方向転換時は減速側を優先
+      if (auto_vx * vx_global < 0.0f)
+      {
+        desired_ax = constrain(desired_ax, -AUTO_DECEL, AUTO_DECEL);
+      }
+      else
+      {
+        desired_ax = constrain(desired_ax, -AUTO_ACCEL, AUTO_ACCEL);
+      }
 
-      // Y方向の速度変化を制限
-      if (dvy > max_delta_v)
-        dvy = max_delta_v;
+      if (auto_vy * vy_global < 0.0f)
+      {
+        desired_ay = constrain(desired_ay, -AUTO_DECEL, AUTO_DECEL);
+      }
+      else
+      {
+        desired_ay = constrain(desired_ay, -AUTO_ACCEL, AUTO_ACCEL);
+      }
 
-      if (dvy < -max_delta_v)
-        dvy = -max_delta_v;
+      // ジャーク制限
+      float max_da = AUTO_JERK * dt;
 
-      auto_vx += dvx;
-      auto_vy += dvy;
+      // X
+      float da_x = desired_ax - auto_ax;
+      da_x = constrain(da_x, -max_da, max_da);
+      auto_ax += da_x;
 
-      // 回転計算
+      // Y
+      float da_y = desired_ay - auto_ay;
+      da_y = constrain(da_y, -max_da, max_da);
+      auto_ay += da_y;
+
+      // 加速度から速度を更新
+
+      auto_vx += auto_ax * dt;
+      auto_vy += auto_ay * dt;
+
+      // 最大速度制限
+      auto_vx = constrain(auto_vx, -AUTO_MAX_V, AUTO_MAX_V);
+      auto_vy = constrain(auto_vy, -AUTO_MAX_V, AUTO_MAX_V);
+      // グローバル座標 → ロボット座標
       vx = auto_vx * cosf(theta) + auto_vy * sinf(theta);
       vy = -auto_vx * sinf(theta) + auto_vy * cosf(theta);
 
-      // ±180° に収める
-      float err_theta = target_theta - theta;
+      // 角度誤差計算
+      err_theta = target_theta - theta;
+
       while (err_theta > PI_F)
         err_theta -= 2 * PI_F;
       while (err_theta < -PI_F)
         err_theta += 2 * PI_F;
 
-      // 誤差0を目標にPID
       rot = pid_theta.update(0, -err_theta, dt);
 
       constexpr float INV_SQRT2 = 0.70710678f;
-
       float gain = 8.0f;
 
       float v1 = ((-vx + vy) * INV_SQRT2 + rot) * gain;
@@ -502,21 +592,39 @@ void loop()
 
       for (int i = 0; i < 4; i++)
       {
-        // 微小出力をカット
-        if (v[i] > 1.0f)
-        {
-          v[i] += FRICTION_OFFSET;
-        }
-        else if (v[i] < -1.0f)
-        {
-          v[i] -= FRICTION_OFFSET;
-        }
-        else
-        {
-          v[i] = 0.0f;
-        }
+        // // 微小出力をカット
+        // if (v[i] > 1.0f)
+        // {
+        //   v[i] += FRICTION_OFFSET;
+        // }
+        // else if (v[i] < -1.0f)
+        // {
+        //   v[i] -= FRICTION_OFFSET;
+        // }
+        // else
+        // {
+        //   v[i] = 0.0f;
+        // }
 
         motor[i] = (int16_t)constrain(v[i], -AUTO_PWM_LIMIT, AUTO_PWM_LIMIT);
+      }
+
+      // 到達判定
+      if (fabsf(target_x - x) < ERROR &&
+          fabsf(target_y - y) < ERROR &&
+          fabsf(err_theta) < 1.0f * PI_F / 180.0f &&
+          fabsf(auto_vx) < 20.0f &&
+          fabsf(auto_vy) < 20.0f) // 1度をラジアンに変換
+      {
+        auto_vx = 0.0f;
+        auto_vy = 0.0f;
+        auto_ax = 0.0f;
+        auto_ay = 0.0f;
+
+        for (int i = 0; i < 4; i++)
+          motor[i] = 0;
+
+        auto_mode = 0;
       }
     }
 
@@ -563,19 +671,14 @@ void loop()
     }
 
     // CAN送信
-    if (micros() - last_can_tx >= 20000)
+    CAN.beginPacket(0x103);
+
+    for (int i = 0; i < 4; i++)
     {
-      last_can_tx = micros();
-
-      CAN.beginPacket(0x103);
-
-      for (int i = 0; i < 4; i++)
-      {
-        CAN.write((uint8_t)(motor[i] >> 8));
-        CAN.write((uint8_t)(motor[i] & 0xFF));
-      }
-
-      CAN.endPacket();
+      CAN.write((uint8_t)(motor[i] >> 8));
+      CAN.write((uint8_t)(motor[i] & 0xFF));
     }
+
+    CAN.endPacket();
   }
 }
