@@ -45,11 +45,11 @@ float x = 0.0f;     // count_1(前後方向)
 float y = 0.0f;     // count_2(左右方向)
 float theta = 0.0f; // count_3(回転)
 
-// PID制御器(Kp(比例), Ki(積分), Kd(微分), pwm出力制限)
+// PID制御器(Kp(比例), Ki(積分), Kd(微分), pwm出力制限, 積分下限, 積分上限)
 const int16_t PWM_LIMIT = 2999; // pwmの最大値
-PositionPID pid_x(0.4, 0.1, 0.05, -PWM_LIMIT, PWM_LIMIT, -100, 100);
-PositionPID pid_y(0.4, 0.1, 0.05, -PWM_LIMIT, PWM_LIMIT, -100, 100);
-PositionPID pid_theta(30.0, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT, -100, 100);
+PositionPID pid_x(0.4, 0.1, 0.05, -PWM_LIMIT, PWM_LIMIT, -1000, 1000);
+PositionPID pid_y(0.4, 0.1, 0.05, -PWM_LIMIT, PWM_LIMIT, -1000, 1000);
+PositionPID pid_theta(35.0, 0.0, 0.001, -PWM_LIMIT, PWM_LIMIT, -300, 300);
 const int16_t AUTO_PWM_LIMIT = 2999;
 
 // 自動制御の速度制限
@@ -167,50 +167,37 @@ void OnDataRecv(const uint8_t *mac,
   case 0x10: // 座標指示
   {
     float dx = (float)recvMsg.param1;
-
-    // 座標系を合わせる必要があるなら反転
     float dy = (float)recvMsg.param2 * (-1.0f);
 
-    // ロボット座標 → グローバル座標
     target_x = (int)(x + dx * cosf(theta) - dy * sinf(theta));
-
     target_y = (int)(y + dx * sinf(theta) + dy * cosf(theta));
-
-    // すでにradへ変換されている
     target_theta = theta + recvMsg.param3;
 
+    if (auto_mode == 0)
+    {
+      pid_x.reset(x);
+      pid_y.reset(y);
+      pid_theta.reset(theta);
+    }
+
     auto_mode = 1;
-
-    // pid_x.reset(x);
-    // pid_y.reset(y);
-    // pid_theta.reset(theta);
-
-    // auto_vx = 0.0f;
-    // auto_vy = 0.0f;
-
-    // Serial.printf(
-    //     "Target : %d %d %.3f rad\n",
-    //     target_x,
-    //     target_y,
-    //     target_theta);
-
     break;
   }
 
   case 0x11:
   {
-    // 絶対座標指定: 変換せずそのまま目標値に
     target_x = recvMsg.param1;
     target_y = recvMsg.param2;
-    target_theta = recvMsg.param3; // ラジアンの絶対角度
+    target_theta = recvMsg.param3;
+
+    if (auto_mode == 0)
+    {
+      pid_x.reset(x);
+      pid_y.reset(y);
+      pid_theta.reset(theta);
+    }
 
     auto_mode = 1;
-    // pid_x.reset(x);
-    // pid_y.reset(y);
-    // pid_theta.reset(theta);
-    // auto_vx = 0.0f;
-    // auto_vy = 0.0f;
-    //  Serial.printf("Target Absolute : %d %d %.3f rad\n", target_x, target_y, target_theta);
     break;
   }
 
@@ -452,6 +439,8 @@ void loop()
     float dy_local = s2;
     float dtheta = (s3 - s1) / (2.0f * L);
 
+    // float mid_theta = theta + (dtheta * 0.5f);
+
     x += dx_local * cosf(theta) - dy_local * sinf(theta);
     y += dx_local * sinf(theta) + dy_local * cosf(theta);
     theta += dtheta;
@@ -592,19 +581,41 @@ void loop()
 
       for (int i = 0; i < 4; i++)
       {
-        // // 微小出力をカット
-        // if (v[i] > 1.0f)
-        // {
-        //   v[i] += FRICTION_OFFSET;
-        // }
-        // else if (v[i] < -1.0f)
-        // {
-        //   v[i] -= FRICTION_OFFSET;
-        // }
-        // else
-        // {
-        //   v[i] = 0.0f;
-        // }
+        const float MAX_PWM_CHANGE = 200.0f; // 制御周期(20ms)あたりのPWM最大変化量
+        constexpr float FRICTION_THRESHOLD_MAX = 200.0f;
+        static float prev_v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        for (int i = 0; i < 4; i++)
+        {
+          // 加速度制限
+          float diff = v[i] - prev_v[i];
+          if (diff > MAX_PWM_CHANGE)
+          {
+            v[i] = prev_v[i] + MAX_PWM_CHANGE;
+          }
+          else if (diff < -MAX_PWM_CHANGE)
+          {
+            v[i] = prev_v[i] - MAX_PWM_CHANGE;
+          }
+          prev_v[i] = v[i];
+
+          float final_out = v[i];
+          // 低出力時の摩擦補償
+          if (final_out > 1.0f && final_out < FRICTION_THRESHOLD_MAX)
+          {
+            final_out += FRICTION_OFFSET;
+          }
+          else if (final_out < -1.0f && final_out > -FRICTION_THRESHOLD_MAX)
+          {
+            final_out -= FRICTION_OFFSET;
+          }
+          else if (final_out >= -1.0f && final_out <= 1.0f)
+          {
+            final_out = 0.0f;
+          }
+
+          motor[i] = (int16_t)constrain(final_out, -AUTO_PWM_LIMIT, AUTO_PWM_LIMIT);
+        }
 
         motor[i] = (int16_t)constrain(v[i], -AUTO_PWM_LIMIT, AUTO_PWM_LIMIT);
       }
@@ -641,9 +652,10 @@ void loop()
       }
       else
       {
-        float vx_m = manual_vx_dir * MANUAL_SPEED;
-        float vy_m = manual_vy_dir * MANUAL_SPEED;
-        float rot_m = manual_rot_dir * MANUAL_ROT_SPEED;
+        // UIから送られてきたPWM値をそのまま使用
+        float vx_m = manual_vx_dir;
+        float vy_m = manual_vy_dir;
+        float rot_m = manual_rot_dir;
 
         constexpr float INV_SQRT2 = 0.70710678f;
         float gain = 8.0f;
